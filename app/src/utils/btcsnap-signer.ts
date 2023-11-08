@@ -6,10 +6,11 @@ import { address, Network, Psbt, Transaction } from "bitcoinjs-lib";
 import { bitcoin, testnet } from "bitcoinjs-lib/src/networks";
 import { RemoteSigner, inscribeText } from "@gobob/bob-sdk/dist/ordinals";
 import { BitcoinNetwork, BitcoinScriptType, getExtendedPublicKey, getMasterFingerprint, getNetworkInSnap, signPsbt } from "./btcsnap-utils";
-import { DefaultElectrsClient } from "@gobob/bob-sdk";
-import { broadcastTx, getAddressUtxos } from "./sdk-helpers";
+import { DefaultElectrsClient, ElectrsClient } from "@gobob/bob-sdk";
+import { broadcastTx, getAddressUtxos, UTXO } from "./sdk-helpers";
 import bs58check from "bs58check";
 import coinSelect from "coinselect";
+import { DefaultOrdinalsClient, InscriptionId, OrdinalsClient } from "./ordinals-client";
 
 bitcoinjs.initEccLib(ecc);
 const bip32 = BIP32Factory(ecc);
@@ -211,4 +212,129 @@ export async function createOrdinal(
   });
   const txid = await res.text();
   return txid;
+}
+
+export async function sendInscription(address: string, inscriptionId: string): Promise<string> {
+  const signer = new BtcSnapSigner();
+
+  // fee rate is 1 for testnet
+  const tx = await transferInscription(signer, address, inscriptionId, 1, 546);
+  const res = await fetch('https://blockstream.info/testnet/api/tx', {
+    method: 'POST',
+    body: tx.toHex()
+  });
+  const txid = await res.text();
+  return txid;
+}
+
+async function findUtxoForInscriptionId(
+  electrsClient: ElectrsClient,
+  ordinalsClient: OrdinalsClient,
+  inscriptionId: InscriptionId,
+  address: string
+): Promise<UTXO> {
+  // TODO: how can we find the UTXO using ordinalsClient?
+
+  /**
+   * Things inspected:
+   * 1) The snippet below returns some data, but does not contain the outpoint - unless inscription id
+   *    changes over time as it is transferred which I don't think it does.
+   * 
+   * const inscriptionUtxo = await ordinalsClient.getInscriptionFromId(inscriptionId as InscriptionId);
+   * 
+   * 2) Getting all utxo, and then looping through them using the snippet below. The problem is
+   *    the InscriptionUTXO returned doesn't seem to contain the inscription id, only the data
+   * 
+   * const inscriptionUtxo = await ordinalsClient.getInscriptionFromUTXO(utxo.txid);
+   * 
+   * 3) ??? some other way I haven't thought of yet
+   * 
+   */
+
+  throw Error("not implemented yet");
+  
+}
+
+/**
+ * Returns a given address' utxos that don't contain any inscriptions.
+ */
+async function getSafeUtxos(
+  electrsClient: ElectrsClient,
+  ordinalsClient: OrdinalsClient,
+  address: string
+): Promise<UTXO[]> {
+  // step 1: get all utxos for the address
+  const utxos = await getAddressUtxos(electrsClient, address);
+
+  const safeUtxos = [];
+  for (const utxo of utxos) {
+    // optimize this later
+    const inscriptionUtxo = await ordinalsClient.getInscriptionFromUTXO(utxo.txid);
+    if (inscriptionUtxo.inscriptions.length === 0) {
+      safeUtxos.push(utxo);
+    }
+  }
+
+  return safeUtxos;
+}
+
+async function transferInscription(
+  signer: BtcSnapSigner,
+  toAddress: string,
+  inscriptionId: string,
+  feeRate: number = 1,
+): Promise<Transaction> {
+  if ( inscriptionId.length !== 64) {
+    throw Error(`Inscription ID has unexpected length: ${inscriptionId.length} (expected: 64)`);
+  }
+
+  const network = await signer.getNetwork();
+  const pubkey = Buffer.from(await signer.getPublicKey(), "hex");
+  const fromAddress = bitcoinjs.payments.p2wpkh({ pubkey, network }).address!;
+
+  const networkName = network === testnet ? "testnet" : "mainnet";
+  const ordinalsClient = new DefaultOrdinalsClient(networkName);
+  const electrsClient = new DefaultElectrsClient(networkName);
+  
+  const inscriptionUtxo = await findUtxoForInscriptionId(electrsClient, ordinalsClient, inscriptionId as InscriptionId, fromAddress);
+
+  // prepare single input
+  const txInputs = [{
+    txId: inscriptionUtxo.txid,
+    vout: inscriptionUtxo.vout,
+    value: inscriptionUtxo.value
+  }];
+
+  // TODO: review output values
+  const txOutputs = [{
+    address: toAddress,
+    value: 1
+  }];
+
+  const { inputs, outputs } = coinSelect(txInputs, txOutputs, feeRate);
+
+  if (inputs === undefined) {
+    throw Error("No inputs returned/selected by coinSelect");
+  }
+
+  if (outputs === undefined) {
+    throw Error("No outputs returned/selected by coinSelect");
+  }
+
+  const psbt = new Psbt({ network });
+
+  throw Error("Implementation incomplete");
+
+  // TODO: continue here
+  // construct psbt inputs
+  // construct outputs containing inscription? (not sure how to)
+  // send psbt to RemoteSigner for signature
+  // return signed psbt
+
+
+  // TODO: snippet can be useful if we need to add more inputs to cover fees
+  // const safeUtxos = await getSafeUtxos(electrsClient, ordinalsClient, fromAddress);
+  // // sort smallest to largest before adding in some
+  // safeUtxos.sort((a , b) => a.value - b.value);
+
 }
