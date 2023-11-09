@@ -101,6 +101,7 @@ export class BtcSnapSigner implements RemoteSigner {
     const network = await this.getNetwork();
     const networkName = network === testnet ? "testnet" : "mainnet";
     const electrsClient = new DefaultElectrsClient(networkName);
+    const ordinalsClient = new DefaultOrdinalsClient(networkName);
 
     const senderPubKey = Buffer.from(await this.getPublicKey(), "hex");
     const senderAddress = bitcoinjs.payments.p2wpkh({ pubkey: senderPubKey, network }).address!;
@@ -110,7 +111,8 @@ export class BtcSnapSigner implements RemoteSigner {
       value: amount
     }];
 
-    const utxos = await getAddressUtxos(electrsClient, senderAddress);
+    const allUtxos = await getAddressUtxos(electrsClient, senderAddress);
+    const utxos = await findSafeUtxos(ordinalsClient, allUtxos);
 
     const { inputs, outputs } = coinSelect(
       utxos.map(utxo => {
@@ -133,44 +135,17 @@ export class BtcSnapSigner implements RemoteSigner {
     }
 
     const psbt = new Psbt({ network });
+    const masterFingerprint = Buffer.from(await getMasterFingerprint() as any, "hex");
+    // TODO: clean up magic paths
+    const derivationPath = "m/84'/1'/0'/0/0";
 
     for (const input of inputs) {
-      const txHex = await electrsClient.getTransactionHex(input.txId);
-      const utx = Transaction.fromHex(txHex);
-
-      const witnessUtxo = {
-        script: utx.outs[input.vout].script,
-        value: input.value,
-      };
-      const nonWitnessUtxo = utx.toBuffer()
-
-      psbt.addInput({
-        hash: input.txId,
-        index: input.vout,
-        nonWitnessUtxo,
-        witnessUtxo,
-        bip32Derivation: [
-          {
-            masterFingerprint: Buffer.from(await getMasterFingerprint() as any, "hex"),
-            path: "m/84'/1'/0'/0/0",
-            pubkey: senderPubKey,
-          }
-        ]
-      });
+      await addPsbtInput(electrsClient, psbt, input, senderPubKey, masterFingerprint, derivationPath);
     }
 
     const changeAddress = senderAddress;
     outputs.forEach(output => {
-      // watch out, outputs may have been added that you need to provide
-      // an output address/script for
-      if (!output.address) {
-        output.address = changeAddress;
-      }
-
-      psbt.addOutput({
-        address: output.address,
-        value: output.value,
-      })
+      addPsbtOutput(psbt, output, changeAddress);
     });
 
     const snapNetwork = await this._getBtcSnapNetwork();
@@ -199,6 +174,57 @@ export class BtcSnapSigner implements RemoteSigner {
   }
 }
 
+async function addPsbtInput(
+  electrsClient: ElectrsClient,
+  psbt: Psbt,
+  input: {txId: string, vout: number, value: number},
+  senderPubKey: Buffer,
+  masterFingerprint: Buffer,
+  derivationPath: string
+
+): Promise<Psbt> {
+  const txHex = await electrsClient.getTransactionHex(input.txId);
+  const utx = Transaction.fromHex(txHex);
+
+  const witnessUtxo = {
+    script: utx.outs[input.vout].script,
+    value: input.value,
+  };
+  const nonWitnessUtxo = utx.toBuffer();
+
+  return psbt.addInput({
+    hash: input.txId,
+    index: input.vout,
+    nonWitnessUtxo,
+    witnessUtxo,
+    bip32Derivation: [
+      {
+        masterFingerprint,
+        path: derivationPath,
+        pubkey: senderPubKey,
+      }
+    ]
+  });
+}
+
+// change address is only added when coinselect outputs have empty addresses
+function addPsbtOutput(
+  psbt: Psbt,
+  output: { address?: string, value: number },
+  changeAddress: string
+): Psbt {
+  // watch out, outputs may have been added that you need to provide
+  // an output address/script for
+  if (!output.address) {
+    output.address = changeAddress;
+  }
+
+  return psbt.addOutput({
+    address: output.address,
+    value: output.value,
+  })
+}
+
 export async function createOrdinal(
   address: string,
   text: string
@@ -218,57 +244,35 @@ export async function sendInscription(address: string, inscriptionId: string): P
   const signer = new BtcSnapSigner();
 
   // fee rate is 1 for testnet
-  const tx = await transferInscription(signer, address, inscriptionId, 1, 546);
-  const res = await fetch('https://blockstream.info/testnet/api/tx', {
-    method: 'POST',
-    body: tx.toHex()
-  });
-  const txid = await res.text();
+  const txid = await transferInscription(signer, address, inscriptionId, 1);
   return txid;
 }
 
 async function findUtxoForInscriptionId(
-  electrsClient: ElectrsClient,
   ordinalsClient: OrdinalsClient,
-  inscriptionId: InscriptionId,
-  address: string
-): Promise<UTXO> {
-  // TODO: how can we find the UTXO using ordinalsClient?
+  utxos: UTXO[],
+  inscriptionId: InscriptionId
+): Promise<UTXO | undefined> {
+  for (const utxo of utxos) {
+    const inscrUtxo =  await ordinalsClient.getInscriptionFromUTXO(utxo.txid);
+    if ( inscrUtxo.inscriptions && inscrUtxo.inscriptions.includes(inscriptionId) ) {
+      return utxo;
+    }
+  }
 
-  /**
-   * Things inspected:
-   * 1) The snippet below returns some data, but does not contain the outpoint - unless inscription id
-   *    changes over time as it is transferred which I don't think it does.
-   * 
-   * const inscriptionUtxo = await ordinalsClient.getInscriptionFromId(inscriptionId as InscriptionId);
-   * 
-   * 2) Getting all utxo, and then looping through them using the snippet below. The problem is
-   *    the InscriptionUTXO returned doesn't seem to contain the inscription id, only the data
-   * 
-   * const inscriptionUtxo = await ordinalsClient.getInscriptionFromUTXO(utxo.txid);
-   * 
-   * 3) ??? some other way I haven't thought of yet
-   * 
-   */
-
-  throw Error("not implemented yet");
-  
+  return undefined;
 }
 
 /**
- * Returns a given address' utxos that don't contain any inscriptions.
+ * Returns only the utxos that don't contain any inscriptions.
  */
-async function getSafeUtxos(
-  electrsClient: ElectrsClient,
+async function findSafeUtxos(
   ordinalsClient: OrdinalsClient,
-  address: string
+  utxos: UTXO[]
 ): Promise<UTXO[]> {
-  // step 1: get all utxos for the address
-  const utxos = await getAddressUtxos(electrsClient, address);
-
   const safeUtxos = [];
   for (const utxo of utxos) {
-    // optimize this later
+    // can be optimized later
     const inscriptionUtxo = await ordinalsClient.getInscriptionFromUTXO(utxo.txid);
     if (inscriptionUtxo.inscriptions.length === 0) {
       safeUtxos.push(utxo);
@@ -283,7 +287,7 @@ async function transferInscription(
   toAddress: string,
   inscriptionId: string,
   feeRate: number = 1,
-): Promise<Transaction> {
+): Promise<string> {
   if ( inscriptionId.length !== 64) {
     throw Error(`Inscription ID has unexpected length: ${inscriptionId.length} (expected: 64)`);
   }
@@ -295,8 +299,13 @@ async function transferInscription(
   const networkName = network === testnet ? "testnet" : "mainnet";
   const ordinalsClient = new DefaultOrdinalsClient(networkName);
   const electrsClient = new DefaultElectrsClient(networkName);
-  
-  const inscriptionUtxo = await findUtxoForInscriptionId(electrsClient, ordinalsClient, inscriptionId as InscriptionId, fromAddress);
+
+  const utxos = await getAddressUtxos(electrsClient, fromAddress);
+  const inscriptionUtxo = await findUtxoForInscriptionId(ordinalsClient, utxos, inscriptionId as InscriptionId);
+
+  if (inscriptionUtxo === undefined) {
+    throw Error(`Unable to find utxo owned by address [${fromAddress}] containing inscription id [${inscriptionId}]`);
+  }
 
   // prepare single input
   const txInputs = [{
@@ -305,13 +314,19 @@ async function transferInscription(
     value: inscriptionUtxo.value
   }];
 
-  // TODO: review output values
+  // TODO: review output values, eg. is one sat enough?
   const txOutputs = [{
     address: toAddress,
     value: 1
   }];
 
   const { inputs, outputs } = coinSelect(txInputs, txOutputs, feeRate);
+
+  // TODO: Might need to add more inputs for fees if utxo is not enough, something like this:
+  // const safeUtxos = await findSafeUtxos(ordinalsClient, utxos, fromAddress);
+  // // sort smallest to largest before adding in some
+  // safeUtxos.sort((a , b) => a.value - b.value);
+  // // pick best fit(s) and do coinselect again.
 
   if (inputs === undefined) {
     throw Error("No inputs returned/selected by coinSelect");
@@ -323,18 +338,20 @@ async function transferInscription(
 
   const psbt = new Psbt({ network });
 
-  throw Error("Implementation incomplete");
+  const masterFingerprint = Buffer.from(await getMasterFingerprint() as any, "hex");
+  // TODO: clean up magic paths
+  const derivationPath = "m/84'/1'/0'/0/0";
+  for (const input of inputs) {
+    await addPsbtInput(electrsClient, psbt, input, pubkey, masterFingerprint, derivationPath);
+  }
 
-  // TODO: continue here
-  // construct psbt inputs
-  // construct outputs containing inscription? (not sure how to)
-  // send psbt to RemoteSigner for signature
-  // return signed psbt
+  const changeAddress = fromAddress;
+  outputs.forEach((output) => {
+    addPsbtOutput(psbt, output, changeAddress);
+  });
 
+  const snapNetwork = network === bitcoin ? BitcoinNetwork.Main : BitcoinNetwork.Test;
+  const tx = await signPsbt(psbt.toBase64(), snapNetwork, hardcodedScriptType);
 
-  // TODO: snippet can be useful if we need to add more inputs to cover fees
-  // const safeUtxos = await getSafeUtxos(electrsClient, ordinalsClient, fromAddress);
-  // // sort smallest to largest before adding in some
-  // safeUtxos.sort((a , b) => a.value - b.value);
-
+  return broadcastTx(electrsClient, tx.txHex);
 }
